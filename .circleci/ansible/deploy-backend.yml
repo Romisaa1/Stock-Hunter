@@ -1,0 +1,11 @@
+- name: "configuration play." 
+  hosts: webservers
+  user: ec2-user
+  gather_facts: false
+  vars:
+    - ansible_python_interpreter: /usr/bin/python3
+    - ansible_host_key_checking: false
+    - ansible_stdout_callback: yaml
+    -  circleci_artifacts_dir: ".circleci/artifacts"
+  roles:
+    - deploy

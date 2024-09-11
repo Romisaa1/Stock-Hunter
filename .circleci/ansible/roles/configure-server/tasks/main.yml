@@ -1,0 +1,65 @@
+- name: Update packages
+  become: yes
+  yum:
+    name: "*"
+    state: latest
+  tags:
+    - update
+
+- name: Install Git
+  become: yes
+  yum:
+    name: git
+    state: present
+  tags:
+    - git
+
+- name: Install tar
+  become: yes
+  yum:
+    name: 
+      - tar
+      - unzip
+      - gzip
+    state: present
+  tags:
+    - tar    
+
+- name: Install required packages
+  become: yes
+  yum:
+    name:
+      - libXcomposite
+      - libXcursor
+      - libXdamage
+      - libXext
+      - libXi
+      - libXtst
+      - libXrandr
+      - libXScrnSaver
+      - alsa-lib
+      - atk
+      - gtk3
+      - clang
+      - cmake
+      - ninja-build
+    state: present
+  tags:
+    - packages
+
+- name: Install nginx
+  become: yes
+  yum:
+    name: nginx
+    state: present
+  tags:
+    - nginx
+
+- name: Download Flutter SDK archive
+  get_url:
+    url: "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.22.2-stable.tar.xz"
+    dest: "/tmp/flutter_linux_3.22.2-stable.tar.xz"
+  become: yes
+  tags:
+    - flutter
+

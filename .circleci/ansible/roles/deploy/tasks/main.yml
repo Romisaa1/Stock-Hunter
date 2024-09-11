@@ -1,0 +1,47 @@
+- name: start applications
+  become: yes
+  shell: |
+    tar xf /tmp/flutter_linux_3.22.2-stable.tar.xz
+    export PATH="$PATH:`pwd`/flutter/bin"
+    flutter precache
+
+- name: Copy artifact.tar.gz to remote host
+  copy:
+    src: "files/artifact.tar.gz"  # Path to the artifact.tar.gz file on the local host
+    dest: "/tmp/artifact.tar.gz"               # Destination path on the remote host
+    mode: '0644'                               # Set appropriate permissions for the file
+
+- name: Unzip artifact file
+  become: yes
+  shell: |
+    mkdir -p stockhunter/build/web
+    tar -xzf /tmp/artifact.tar.gz -C stockhunter/build/web
+
+- name: Ensure Nginx service is started and enabled
+  become: yes
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+
+- name : Prepare Files
+  become: yes
+  shell: |
+    mkdir -p /var/www/stockhunter
+    cp -r stockhunter/build/web /var/www/stockhunter
+
+- name: Copy Nginx configuration template
+  become: yes
+  template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/conf.d/{{ item }}.conf
+  loop: "{{ groups['webservers'] }}"
+  
+
+- name: Restart Nginx service
+  become: yes
+  service:
+    name: nginx
+    state: restarted
+  
+

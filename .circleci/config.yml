@@ -1,0 +1,243 @@
+version: 2.1
+
+commands:
+  destroy-environment:
+    description: Destroy cloudformation stacks given a workflow ID.  
+    steps:
+      - run:
+          name: Destroy environments
+          when: on_fail
+          command: |
+             aws cloudformation delete-stack --stack-name stockhunter-network-${CIRCLE_WORKFLOW_ID:0:7}
+             aws cloudformation delete-stack --stack-name stockhunter-servers-${CIRCLE_WORKFLOW_ID:0:7}
+
+jobs:
+  build-flutter:
+    docker:
+      - image: slashwhyorganization/flutter-sdk-image:3.22.2                                                                                                            #slashwhyorganization/flutter-sdk-image:3.19.0
+    steps:
+      - checkout
+      - restore_cache:
+          keys: [flutter-web-build]
+      - run:
+          name: Install dependencies
+          command: |
+            cd Flutter
+            flutter pub get
+      - run:
+          name: Build Flutter 
+          command: |
+            cd Flutter
+            flutter build web --release
+      - persist_to_workspace:
+          root: Flutter/build/web
+          paths:
+            - .      
+      - save_cache:
+          paths: [./.dart_tool/flutter/build]
+          key: flutter-web-build
+    
+    
+  deploy-infrastructure:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: Ensure network infrastructure exists
+          command: |
+            yum install -y jq 
+            aws cloudformation deploy \
+            --template-file .circleci/infrastructure/network.yml \
+            --stack-name "stockhunter-network-${CIRCLE_WORKFLOW_ID:0:7}" \
+            --parameter-overrides $(jq -r '.[] | "\(.ParameterKey)=\(.ParameterValue)"' < .circleci/infrastructure/network-parameters.json) ID="${CIRCLE_WORKFLOW_ID:0:7}" \
+            --region us-east-1 \
+            --tags project=stockhunterproject
+
+           
+      - run:
+          name: Ensure servers infrastructure exist
+          command: |
+            aws cloudformation deploy \
+            --template-file .circleci/infrastructure/servers.yml \
+            --stack-name "stockhunter-servers-${CIRCLE_WORKFLOW_ID:0:7}" \
+            --parameter-overrides $(jq -r '.[] | "\(.ParameterKey)=\(.ParameterValue)"' < .circleci/infrastructure/server-parameters.json) ID="${CIRCLE_WORKFLOW_ID:0:7}" \
+            --region us-east-1 \
+            --tags project=stockhunterproject
+            
+              
+      - run:
+          name: install tar and gzip 
+          command: |
+             yum -y install tar gzip
+
+      - run:
+          name: Add back-end ip to ansible inventory
+          command: |
+            #!/bin/bash
+            INSTANCE_NAME="stockhunter-webserver"
+            INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$INSTANCE_NAME" --query "Reservations[].Instances[].InstanceId" --output text)
+            IP_ADDRESSES=""
+            for INSTANCE_ID in $INSTANCE_IDS; do
+                # Get the public IP address of the instance
+                PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[].Instances[].PublicIpAddress" --output text)
+                # Append the public IP address to the list
+                IP_ADDRESSES="$IP_ADDRESSES $PUBLIC_IP"
+            done
+            # Append the IP addresses to the Ansible inventory file
+            echo "[webservers]" >> .circleci/ansible/inventory.txt
+            echo "$IP_ADDRESSES" | tr ' ' '\n' >> .circleci/ansible/inventory.txt  
+            cat .circleci/ansible/inventory.txt             
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - project/.circleci/ansible/inventory.txt  
+      - destroy-environment  
+
+  configure-infrastructure:
+    docker:
+      - image: python:3.12.0rc3-alpine3.18
+    steps:
+      - checkout
+      - add_ssh_keys:
+         fingerprints: ["SHA256:jZ/eCn+oNL2N9pUS8HTv09gldfrrVw6EilsMN4VCwYA"] 
+      - attach_workspace:
+         at: ~/
+               
+      - run:
+          name: Install dependencies
+          command: |
+            
+            apk add --update ansible
+            apk add --update tar gzip
+            
+      - run:
+          name: Configure server
+          command: |
+            cd .circleci/ansible
+            ansible-playbook -i inventory.txt configure-server.yml   
+      #- destroy-environment 
+
+  deploy-flutter:
+    docker:
+      - image: python:3.12.0rc3-alpine3.18
+    steps:
+      - checkout
+      - add_ssh_keys:
+           fingerprints: ["SHA256:jZ/eCn+oNL2N9pUS8HTv09gldfrrVw6EilsMN4VCwYA"] 
+      - attach_workspace:
+         at: ~/
+      - restore_cache:
+          keys:
+            - flutter-web-build   
+      - run:
+          name: Install dependencies
+          command: |
+            apk add --update ansible
+            apk add --update tar gzip unzip
+            # apk add --update nodejs
+            # apk add --update npm
+      - run:
+          name: Deploy backend
+          command: |
+            tar -C Flutter/build/web -czvf artifact.tar.gz .
+            mkdir -p ~/project/.circleci/ansible/roles/deploy/files/
+            mv artifact.tar.gz .circleci/ansible/roles/deploy/files/artifact.tar.gz
+            cd .circleci/ansible
+            echo "Contents  of the inventory.txt file is -------"
+            cat inventory.txt
+            ansible-playbook -i inventory.txt deploy-backend.yml   
+      #- destroy-environment
+      
+  smoke-test:
+    docker:
+      - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: Get load balancer URL
+          command: |
+            #!/bin/bash
+            LB_URL=$(aws elbv2 describe-load-balancers --query "LoadBalancers[0].DNSName" --output text)
+            echo "Load balancer URL: $LB_URL"
+            if curl -s ${LB_URL} | grep "Stock Hunter"                  
+            then
+              exit 0
+            else
+              exit 1
+            fi  
+      - destroy-environment  
+
+  cleanup:
+    docker:
+    - image: amazon/aws-cli
+    steps:
+    - checkout
+    - run:
+        name: install tar and gzip 
+        command: |
+          yum -y install tar gzip
+          yum -y install jq
+    - attach_workspace: 
+        at: ~/
+    - run:
+        name: Get old stack workflow id
+        command: |
+          raw_output=$(aws cloudformation list-exports --query "Exports[?contains(Name, 'WorkflowID-stockhunter')].Value" --output json)
+          echo "$raw_output" | jq -r '.[]' | while IFS= read -r workflow_id; do
+              workflow_id=$(echo "$workflow_id" | sed -e 's/^"//' -e 's/"$//')
+
+              if [[ "$workflow_id" == "${CIRCLE_WORKFLOW_ID:0:7}" ]]; then
+                  echo "Current WorkflowID: $workflow_id"
+              else
+                  echo "$workflow_id" > /tmp/old_workflow_id.txt
+                  echo "Old WorkflowID: $workflow_id"
+              fi
+          done
+    - run:
+        name: Read old workflow id and delete stacks
+        command: |
+          if [ -f /tmp/old_workflow_id.txt ]; then
+            export OldWorkflowID=$(cat /tmp/old_workflow_id.txt)
+            export STACKS=($(aws cloudformation list-stacks --query "StackSummaries[*].StackName" --stack-status-filter CREATE_COMPLETE --no-paginate --output text)) 
+            echo "Stack names: ${STACKS[@]}"
+            
+            match_found=false
+            for stack in "${STACKS[@]}"; do
+              if [[ "$stack" == *"${OldWorkflowID}"* ]]; then
+                match_found=true
+                break
+              fi
+            done
+
+            if $match_found; then
+              echo "Deleting stacks with OldWorkflowID: $OldWorkflowID"
+              aws cloudformation delete-stack --stack-name "stockhunter-servers-${OldWorkflowID}"
+              sleep 120
+              aws cloudformation delete-stack --stack-name "stockhunter-network-${OldWorkflowID}"
+            else
+              echo "NOTHING TO CLEAN"
+            fi
+          else
+            echo "No old workflow ID found"
+          fi
+ 
+     
+      
+workflows:
+  default:
+    jobs:
+      - build-flutter
+      - deploy-infrastructure:
+          requires: [build-flutter]
+      - configure-infrastructure:
+          requires: [deploy-infrastructure]      
+      - deploy-flutter:
+          requires: [configure-infrastructure] 
+      - smoke-test:
+          requires: [deploy-flutter]   
+      - cleanup:
+          requires: [smoke-test]    
+
+
+             
